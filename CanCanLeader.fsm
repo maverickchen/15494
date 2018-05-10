@@ -1,0 +1,115 @@
+from cozmo.util import Pose
+from cozmo_fsm import *
+#from .pilot import PilotToPose, PilotCheckStart, ParentPilotEvent, InvalidPose
+
+class RaiseLower(StateNode):
+    $setup {
+        raiseLower: StateNode() =N=> { lookDown, raiseLift } =C=> 
+                { lowerLift, lookUp } =C=> ParentCompletes()
+        raiseLift:SetLiftHeight(1)
+        lowerLift:SetLiftHeight(0) 
+        lookUp: SetHeadAngle(30) 
+        lookDown: SetHeadAngle(-25) 
+    }
+
+class Kicks(StateNode):
+    $setup{
+        Turn(30) =C=> RaiseLower() =C=> Turn(-60) =C=> RaiseLower() =C=>
+        Turn(60) =C=> RaiseLower() =C=> 
+        Turn(-60) =C=> Turn(30) =C=> ParentCompletes()
+    }
+
+class SmallDance(StateNode):
+    $setup{
+       Forward(10) =C=> Kicks() =C=> Forward(-10) =C=> ParentCompletes()
+    }
+
+class BigDance(StateNode):
+    $setup{
+        SetLiftHeight(0) =C=> Forward(10) =C=> Turn(30) =C=> 
+        RaiseLower() =C=> Turn(-30) =C=> Forward(-10) =C=> 
+        Forward(10) =C=> Turn(-30) =C=> RaiseLower() =C=> 
+        Turn(30) =C=> Forward(-10) =C=> ParentCompletes()
+    }
+
+class IsServer(StateNode):
+    def start(self, event=None):
+        super().start()
+        
+        # self.post_failure()
+        # print(self.robot.world.is_server)
+        # if (self.robot.world.is_server):
+        #     print('Server')
+        #     self.post_success()
+        # else: 
+        #     print('Client')
+        #     self.post_failure()
+
+
+class SendLocation(StateNode):
+    def start(self, event=None):
+        newMsgObj = ServerMessage(cozmo_id = self.robot.aruco_id, message = self.robot.pose)
+        self.robot.world.world_map.objects['Message-'+str(time.time())] = newMsgObj
+        super().start()
+        self.post_completion()
+
+class ListenLocation(StateNode):
+    def start(self, event=None):
+        super().start()
+        for key, value in self.robot.world.world_map.objects.items():
+            if isinstance(key, str) and 'Message' in key and value.id != self.robot.aruco_id:
+                if isinstance(value.msg, Pose):
+                    pose = value.msg
+                    self.post_data(Pose(pose.position.x+150, pose.position.y, pose.position.z, angle_z=pose.rotation.angle_z))
+        self.post_failure()
+
+class GoToServerPose(PilotToPose):
+    def __init__(self):
+        super().__init__(None)
+
+    def start(self,event=None):
+        if self.running: return
+        if isinstance(event, DataEvent):
+            print(event.data)
+            if isinstance(event.data, cozmo.util.Pose):
+                self.target_pose = event.data
+        super().start(event)
+
+class ListenArrived(StateNode):
+    def start(self, event=None):
+        super().start()
+        for key, value in self.robot.world.world_map.objects.items():
+            if isinstance(key, str) and 'Message' in key and value.id != self.robot.aruco_id:
+                print('Message',value.msg)
+                if ("Arrived" == value.msg):
+                    self.post_success()
+        self.post_failure()
+
+                
+class LineUp(StateNode):
+    $setup {
+        server:IsServer() =S=> ServerSend(msg=self.robot.pose) =C=> listenArrive:ListenArrived() =S=> ParentCompletes()
+        listenArrive =F=> listenArrive
+
+        server =F=> listenLocation:ListenLocation() =D=> GoToServerPose() =C=> ServerSend(msg='Arrived') =C=> ParentCompletes()
+        listenLocation =F=> listenLocation
+    }
+            
+
+class CanCan(StateNode):
+    # setup for CanCan
+    $setup {
+        LineUp() =C=>
+        SetLiftHeight(0) =C=> BigDance() =C=> SmallDance() =C=> 
+        SmallDance() =C=> Say("I guess we're the little engines that CAN CAN")
+    }
+
+'''
+what is the server responsible for?
+Which cozmo is going to be the 'leader'? Is the server going to be the leader? 
+How do cozmos decide where to line up?
+Each cozmo sends a ready signal to the server. The server can tell us when all cozmos have signalled ready and send a message to all clients cozmos when all are ready so they can all start at the same time
+
+Have server decide which cozmo will be the leader on connection.
+'''
+
