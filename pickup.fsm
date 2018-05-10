@@ -1,0 +1,575 @@
+from cozmo.util import Pose
+from cozmo.objects import LightCube
+
+from .nodes import *
+from .transitions import *
+from .transform import wrap_angle
+from .pilot import PilotToPose, PilotCheckStart, ParentPilotEvent, InvalidPose
+from .worldmap import LightCubeObj
+from .doorpass import WallPilotToPose
+from .trace import tracefsm
+
+from math import sin, cos, atan2, pi, sqrt
+
+
+def quat2rot(q0,q1,q2,q3):
+    # formula from http://stackoverflow.com/questions/7938373/from-quaternions-to-opengl-rotations
+    q0_sq = q0*q0; q1_sq = q1*q1; q2_sq = q2*q2; q3_sq = q3*q3
+    t_q0q1 = 2. * q0 * q1
+    t_q0q2 = 2. * q0 * q2
+    t_q0q3 = 2. * q0 * q3
+    t_q1q2 = 2. * q1 * q2
+    t_q1q3 = 2. * q1 * q3
+    t_q2q3 = 2. * q2 * q3
+    return np.array([
+        [ q0_sq+q1_sq-q2_sq-q3_sq, t_q1q2-t_q0q3,           t_q1q3+t_q0q2,           0. ],
+        [ t_q1q2+t_q0q3,           q0_sq-q1_sq+q2_sq-q3_sq, t_q2q3-t_q0q1,           0. ],
+        [ t_q1q3-t_q0q2,           t_q2q3+t_q0q1,           q0_sq-q1_sq-q2_sq+q3_sq, 0. ],
+        [             0.,                     0.,                      0.,           1.  ]])
+
+def rotationMatrixToEulerAngles(R) :
+    sy = sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
+    singular = sy < 1e-6
+    if  not singular :
+        x = atan2(R[2,1] , R[2,2])
+        y = atan2(-R[2,0], sy)
+        z = atan2(R[1,0], R[0,0])
+    else :
+        x = atan2(-R[1,2], R[1,1])
+        y = atan2(-R[2,0], sy)
+        z = 0
+ 
+    return np.array([x, y, z])
+
+
+class GoToCube(StateNode):
+    def __init__(self, cube=None):
+        self.object = cube
+        super().__init__()
+
+    def start(self, event=None):
+        # self.object will normally be set up by the parent of this node
+        if isinstance(self.object, LightCube):
+            self.wmobject = self.robot.world.world_map.objects[self.object]
+        elif isinstance(self.object, LightCubeObj):
+            self.wmobject = self.object
+            self.object = self.object.sdk_obj
+        else:
+            raise ValueError(self.object)
+        self.children['looker'].object = self.object
+        super().start(event)
+        if self.wmobject.pose_confidence < 0 or not self.object.pose.is_valid:
+            print('GoToCube: cube has invalid pose!', self.wmobject)
+            self.post_event(PilotEvent(InvalidPose))
+            self.post_failure()
+
+
+    def pick_side(self, dist, use_world_map):
+        "*** NOTE: This code is only correct for upright cubes"
+        isOnSide = False
+        (q0,q1,q2,q3) = self.parent.object.pose.rotation.q0_q1_q2_q3
+        point = [0,0,1,1]
+        angles = rotationMatrixToEulerAngles(quat2rot(q0,q1,q2,q3))
+        frontFace =np.dot(quat2rot(q0,q1,q2,q3),point)
+        m = sqrt(frontFace[0]**2 + frontFace[1]**2 + frontFace[2]**2)
+        frontFace = [frontFace[0]/m, frontFace[1]/m,frontFace[2]/m]
+        print("front vector has unit direction",frontFace)
+
+
+        def closeTo0(z):
+            diff = abs(0 - abs(z))
+            print('Difference', diff)
+            return diff < .09
+        def closeToPIover2(angle):
+            return abs(pi/2 - abs(angle)) < .09
+
+
+        #isOnSide = (closeToPIover2(angles[0]) or closeToPIover2(angles[1]) )
+        isOnSide = closeTo0(frontFace[2])
+
+        cube = self.object
+        if use_world_map:
+            print('using world map coords')
+            wobj = self.robot.world.world_map.objects[cube]
+            x = wobj.x
+            y = wobj.y
+            ang = wobj.theta
+            rx = self.robot.world.particle_filter.pose[0]
+            ry = self.robot.world.particle_filter.pose[1]
+        else:
+            print('using non world map coords')
+            x = cube.pose.position.x
+            y = cube.pose.position.y
+            ang = cube.pose.rotation.angle_z.radians
+            rx = self.robot.pose.position.x
+            ry = self.robot.pose.position.y
+
+        if (isOnSide):
+            print("Cube is on side!")
+            dx = frontFace[0]
+            dy = frontFace[1]
+            dz = frontFace[2]
+            ang = atan2(dy,dx)
+            backside = [ x - dx*dist, y - dy*dist, ang]
+            return backside
+        else:
+            side1 = [ (x + cos(ang)*dist), (y + sin(ang)*dist), ang + pi   ]
+            side2 = [ (x - cos(ang)*dist), (y - sin(ang)*dist), ang        ]
+            side3 = [ (x + sin(ang)*dist), (y - cos(ang)*dist), ang + pi/2 ]
+            side4 = [ (x - sin(ang)*dist), (y + cos(ang)*dist), ang - pi/2 ]
+
+            sides = (side1, side2, side3, side4)
+            sorted_sides = sorted(sides, key=lambda pt: (pt[0]-rx)**2 + (pt[1]-ry)**2)
+            return sorted_sides[0]
+
+    def almost_docked(self, side, use_world_map):
+        """Returns True if we're almost docked with the cube so we don't
+        need to check for collisions."""
+        if use_world_map:
+            rx = self.robot.world.particle_filter.pose[0]
+            ry = self.robot.world.particle_filter.pose[1]
+            rtheta = self.robot.world.particle_filter.pose[2]
+        else:
+            rx = self.robot.pose.position.x
+            ry = self.robot.pose.position.y
+            rtheta = self.robot.pose.rotation.angle_z.radians
+        dist = math.sqrt((rx-side[0])**2 + (ry-side[1])**2)
+        relative_angle = abs(wrap_angle(rtheta-side[2]) % (pi/2)) * (180/pi)
+        return (dist < 100) and (relative_angle < 10)
+
+    class GoToSide(PilotToPose):
+        def __init__(self):
+            super().__init__(None)
+
+        def start(self, event=None):
+            cube = self.parent.object
+            print('Selected cube',self.parent.wmobject)
+            (x, y, theta) = self.parent.pick_side(100, use_world_map=True)
+            self.target_pose = Pose(x, y, self.robot.pose.position.z,
+                                    angle_z=Angle(radians = wrap_angle(theta)))
+            print('pickup.GoToSide: traveling to (%.1f, %.1f) @ %.1f deg.' %
+                  (self.target_pose.position.x, self.target_pose.position.y,
+                   self.target_pose.rotation.angle_z.degrees))
+            super().start(event)
+
+    class ReportPosition(StateNode):
+        def __init__(self,id=None):
+            super().__init__()
+            self.id_string = id + ': ' if id else ''
+
+        def start(self,event=None):
+            super().start(event)
+            cube = self.parent.object
+            if cube.is_visible:
+                vis = 'visible'
+            else:
+                vis = 'not visible'
+            cx = cube.pose.position.x
+            cy = cube.pose.position.y
+            rx = self.robot.pose.position.x
+            ry = self.robot.pose.position.y
+            dx = cx - rx
+            dy = cy - ry
+            dist = math.sqrt(dx*dx + dy*dy)
+            bearing = wrap_angle(atan2(dy,dx) - self.robot.pose.rotation.angle_z.radians) * 180/pi
+            print('%scube %s at (%5.1f,%5.1f)  robot at (%5.1f,%5.1f)  dist=%5.1f  brg=%5.1f' %
+                  (self.id_string, vis, cx, cy, rx, ry, dist, bearing))
+
+
+    class TurnToCube(Turn):
+        def __init__(self, offset=0, check_vis=False):
+            self.offset = offset
+            self.check_vis = check_vis
+            super().__init__()
+
+        def start(self, event=None):
+            if self.running: return
+            cube = self.parent.object
+            if self.check_vis and not cube.is_visible:
+                print('** TurnToCube could not see the cube.')
+                self.angle = None
+                super().start(event)
+                self.post_failure()
+            else:
+                (cx, cy, _) = self.parent.pick_side(self.offset, False)
+                rx = self.robot.pose.position.x
+                ry = self.robot.pose.position.y
+                dx = cx - rx
+                dy = cy - ry
+                dist = math.sqrt(dx*dx + dy*dy)
+                self.angle = degrees(wrap_angle(atan2(dy,dx) - self.robot.pose.rotation.angle_z.radians) \
+                                     * 180/pi)
+                if abs(self.angle.degrees) <= 2:
+                    self.angle = degrees(0)
+                print('TurnToCube: cube at (%5.1f,%5.1f)  robot at (%5.1f,%5.1f)  dist=%5.1f  angle=%5.1f' %
+                      (cx, cy, rx, ry, dist, self.angle.degrees))
+                super().start(event)
+
+    class CheckAlmostDocked(StateNode):
+        def start(self, event=None):
+            if self.running: return
+            super().start(event)
+            cube = self.parent.object
+            if not cube.is_visible:
+                self.post_failure()
+            side = self.parent.pick_side(25, False)
+            if self.parent.almost_docked(side,False):
+                self.post_success()
+            else:
+                self.post_failure()
+
+    class ForwardToCube(Forward):
+        def __init__(self, offset):
+            self.offset = offset
+            super().__init__()
+
+        def start(self, event=None):
+            if self.running: return
+            cube = self.parent.object
+            dx = cube.pose.position.x - self.robot.pose.position.x
+            dy = cube.pose.position.y - self.robot.pose.position.y
+            self.distance = Distance(sqrt(dx*dx + dy*dy) - self.offset)
+            super().start(event)
+
+    $setup{
+        # GoToCube machine
+        
+        droplift: SetLiftHeight(0) =C=> waitlift
+        droplift =F=> waitlift   # will fail if on charger
+
+        waitlift: StateNode() =T(0.5)=>    # allow time for vision to set up world map
+           {looker, check_almost_docked_0}
+
+        looker: LookAtObject()
+
+        check_almost_docked_0: StateNode() =T(1)=> check_almost_docked
+        
+        check_almost_docked: self.CheckAlmostDocked()
+        check_almost_docked =S=> go_cube2
+        check_almost_docked =F=> check_start
+
+        check_start: PilotCheckStart()
+        check_start =S=> go_side
+        check_start =F=> Forward(-80) =C=> StateNode() =T(0.5)=> check_start
+
+        go_side: self.GoToSide()
+        go_side =PILOT=> go_side_pilot: ParentPilotEvent()
+        go_side =F=> ParentFails()
+        go_side =C=> self.ReportPosition('go_side')
+            =T(0.75)=> self.ReportPosition('go_side')
+            =T(0.75)=> self.ReportPosition('go_side')
+            =N=> go_cube1
+
+        go_cube1: self.TurnToCube(0,True) =C=>
+            self.ReportPosition('go_cube1') =T(0.75)=> self.ReportPosition('go_cube1')
+            =T(0.75)=> self.ReportPosition('go_cube1') =N=> approach
+        go_cube1 =F=> Forward(-50) =C=> StateNode() =T(1)=> go_cube2
+
+        approach: self.ForwardToCube(60) =C=>
+            self.ReportPosition('approach') =T(0.75)=> self.ReportPosition('approach') =T(0.75)=>
+            self.ReportPosition('approach') =N=>
+            self.TurnToCube(0,False) =C=> self.ForwardToCube(15) =C=> end
+
+        go_cube2: self.TurnToCube(0,True)
+        go_cube2 =F=> Print("Cube Lost") =N=> ParentFails()
+        go_cube2 =C=> self.ForwardToCube(60) =C=>
+            self.TurnToCube(0,False) =C=> self.ForwardToCube(20) =C=> end
+
+        end: ParentCompletes()
+    }
+
+class SetCarrying(StateNode):
+    def __init__(self,objparam=None):
+        self.objparam = objparam
+        self.object = None
+        super().__init__()
+        
+    def start(self, event=None):
+        if self.objparam is not None:
+            self.object = self.objparam
+        elif self.object is None:
+            self.object = self.parent.object
+        if isinstance(self.object, LightCube):
+            self.wmobject = self.robot.world.world_map.objects[self.object]
+        elif isinstance(self.object, LightCubeObj):
+            self.wmobject = self.object
+            self.object = self.object.sdk_obj
+        else:
+            raise ValueError(self.object)
+        self.robot.carrying = self.wmobject
+        self.wmobject.update_from_sdk = False
+        self.wmobject.pose_confidence = +1
+        super().start(event)
+        self.post_completion()
+
+class SetNotCarrying(StateNode):
+    def start(self,event=None):
+        self.robot.carrying = None
+        self.parent.object = None
+        super().start(event)
+        self.post_completion()
+
+class PickUpCube(StateNode):
+    """Pick up a cube using our own dock and verify routines.
+    Set self.object to indicate the cube to be picked up."""
+    
+    class VerifyPickup(StateNode):
+        def probe_column(self, im, col, row_start, row_end):
+            """
+            Probe one column of the image, looking for the top horizontal
+            black bar of the cube marker.  This bar should be 22-24 pixels
+            thick.  Use adaptive thresholding by sorting the pixels and
+            finding the darkest ones to set the black threshold.
+            """
+            pixels = [float(im[r,col,0]) for r in range(row_start,row_end)]
+            #print('Column ',col,':',sep='')
+            #[print('%4d' % i,end='') for i in pixels]
+            pixels.sort()
+            npix = len(pixels)
+            bindex = 1
+            bsum = pixels[0]
+            bmax = pixels[0]
+            bcnt = 1
+            windex = npix-2
+            wsum = pixels[npix-1]
+            wmin = pixels[npix-1]
+            wcnt = 1
+            while bindex < windex:
+                if abs(bmax-pixels[bindex]) < abs(wmin-pixels[windex]):
+                    i = bindex
+                    bindex += 1
+                else:
+                    i = windex
+                    windex -= 1
+                bmean = bsum / bcnt
+                wmean = wsum / wcnt
+                val = pixels[i]
+                if abs(val-bmean) < abs(val-wmean):
+                    bsum += val
+                    bcnt += 1
+                    bmax = max(bmax,val)
+                else:
+                    wsum += val
+                    wcnt +=1
+                    wmin = min(wmin,val)
+            black_thresh = bmax
+            index = row_start
+            nrows = im.shape[0]
+            black_run_length = 0
+            # initial white run
+            while index < nrows and im[index,col,0] > black_thresh:
+                index += 1
+            if index == nrows: return -1
+            while index < nrows and im[index,col,0] <= black_thresh:
+                black_run_length += 1
+                index +=1
+            if index >= nrows-5:
+                retval = -1
+            else:
+                retval = black_run_length
+            print('  col=%3d wmin=%5.1f wmean=%5.1f bmean=%5.1f black_thresh=%5.1f run_length=%d' %
+                  (col, wmin, wmean, bmean, black_thresh, black_run_length))
+            return retval
+
+        def start(self,event=None):
+            super().start(event)
+            im = np.array(self.robot.world.latest_image.raw_image)
+            min_length = 23
+            max_length = 32
+            bad_runs = 0
+            print('Verifying pickup.  hangle=%4.1f langle=%4.1f lheight=%4.1f' %
+                  (self.robot.head_angle.degrees, self.robot.lift_angle.degrees,
+                   self.robot.lift_height.distance_mm))
+            for col in range(100,220,20):
+                run_length = self.probe_column(im, col, 0, 100)
+                if run_length < min_length or run_length > max_length:
+                    bad_runs += 1
+            print('  Number of bad_runs:', bad_runs)
+            if bad_runs < 2:
+                self.post_success()
+            else:
+                self.post_failure()                
+
+    # PickUpCube methods
+
+    def __init__(self, cube=None):
+        self.cube = cube
+        super().__init__()
+
+    def picked_up_handler(self):
+        print("PickUpCube aborting because robot was picked up.")
+        self.post_failure()
+        self.stop()
+
+    def start(self, event=None):
+        if isinstance(self.cube, LightCube):
+            self.object = self.cube
+            self.wmobject = self.robot.world.world_map.objects[self.object]
+        elif isinstance(self.cube, LightCubeObj):
+            self.wmobject = self.cube
+            self.object = self.cube.sdk_obj
+        elif isinstance(self.object, LightCube):
+            self.wmobject = self.robot.world.world_map.objects[self.object]
+        elif isinstance(self.object, LightCubeObj):
+            self.wmobject = self.object
+            self.object = self.object.sdk_obj
+        else:
+            raise ValueError(self.object)
+        self.children['goto_cube'].object = self.object
+        print('Picking up',self.wmobject)
+        super().start(event)
+
+    $setup{  # PickUpCube machine
+        goto_cube: GoToCube()
+        goto_cube =PILOT=> goto_cube_pilot: ParentPilotEvent() =N=> ParentFails()
+        goto_cube =F=> ParentFails()
+        goto_cube =C=> AbortAllActions() # clear head and lift tracks
+          =C=> {raise_lift, raise_head}
+
+        #raise_lift: SetLiftHeight(0.7)
+        #raise_head: SetHeadAngle(28)
+        raise_lift: SetLiftHeight(0.4)
+        raise_head: SetHeadAngle(0)
+
+        {raise_lift, raise_head} =C=> verify
+
+        verify: self.VerifyPickup()
+        verify =S=> satisfied
+        verify =F=> StateNode() =T(0.5)=> verify2
+        verify2: self.VerifyPickup()
+        verify2 =S=> satisfied
+        verify2 =F=> StateNode() =T(0.5)=> verify3
+        verify3: self.VerifyPickup()
+        verify3 =S=> satisfied
+        verify3 =F=> frustrated
+
+        satisfied: AnimationTriggerNode(trigger=cozmo.anim.Triggers.ReactToBlockPickupSuccess,
+                                        ignore_body_track=True,
+                                        ignore_head_track=True,
+                                        ignore_lift_track=True)
+        satisfied =C=> {final_raise, drop_head}
+
+        final_raise: SetLiftHeight(1.0)
+        drop_head: SetHeadAngle(0)
+        {final_raise, drop_head} =C=> SetCarrying() =N=> ParentCompletes()
+
+        frustrated: StateNode() =N=> AnimationTriggerNode(trigger=cozmo.anim.Triggers.FrustratedByFailure,
+                                         ignore_body_track=True,
+                                         ignore_head_track=True,
+                                         ignore_lift_track=True) =C=>
+        missed_cube: SetNotCarrying() =C=> Forward(-5) =C=> {drop_lift, drop_head_low}
+
+        drop_lift: SetLiftHeight(0) =C=> backupmore: Forward(-5)
+        drop_head_low: SetHeadAngle(-20)
+        {backupmore, drop_head_low} =C=> ParentFails()
+
+        }
+
+class DropObject(StateNode):
+    def __init__(self):
+        super().__init__()
+
+    $setup {
+        SetLiftHeight(0) =C=> SetNotCarrying() =N=> Forward(-10) =C=> ParentCompletes()
+    }
+
+
+class PickUpCubeForeign(StateNode):
+
+    def __init__(self, cube_id=None):
+        self.object_id = cube_id
+        super().__init__()
+
+    def start(self, event=None):
+        # self.object will be set up by the parent of this node
+        self.object = self.robot.world.light_cubes[self.object_id]
+        self.foreign_cube_id = 'LightCubeForeignObj-'+str(self.object_id)
+        super().start(event)
+
+    def pick_side(self, dist, use_world_map):
+        "*** NOTE: This code is only correct for upright cubes"
+        isOnSide = False
+        (q0,q1,q2,q3) = self.parent.object.pose.rotation.q0_q1_q2_q3
+        point = [0,0,1,1]
+        angles = rotationMatrixToEulerAngles(quat2rot(q0,q1,q2,q3))
+        frontFace =np.dot(quat2rot(q0,q1,q2,q3),point)
+        m = sqrt(frontFace[0]**2 + frontFace[1]**2 + frontFace[2]**2)
+        frontFace = [frontFace[0]/m, frontFace[1]/m,frontFace[2]/m]
+        print("front vector has unit direction",frontFace)
+
+
+        def closeTo0(z):
+            diff = abs(0 - abs(z))
+            print('Difference', diff)
+            return diff < .09
+        def closeToPIover2(angle):
+            return abs(pi/2 - abs(angle)) < .09
+
+
+        #isOnSide = (closeToPIover2(angles[0]) or closeToPIover2(angles[1]) )
+        isOnSide = closeTo0(frontFace[2])
+
+        cube = self.object
+        if use_world_map:
+            print('using world map coords')
+            wobj = self.robot.world.world_map.objects[cube]
+            x = wobj.x
+            y = wobj.y
+            ang = wobj.theta
+            rx = self.robot.world.particle_filter.pose[0]
+            ry = self.robot.world.particle_filter.pose[1]
+        else:
+            print('using non world map coords')
+            x = cube.pose.position.x
+            y = cube.pose.position.y
+            ang = cube.pose.rotation.angle_z.radians
+            rx = self.robot.pose.position.x
+            ry = self.robot.pose.position.y
+
+        if (isOnSide):
+            print("Cube is on side!")
+            dx = frontFace[0]
+            dy = frontFace[1]
+            dz = frontFace[2]
+            ang = atan2(dy,dx)
+            backside = [ x - dx*dist, y - dy*dist, ang]
+            return backside
+        else:
+            side1 = [ (x + cos(ang)*dist), (y + sin(ang)*dist), ang + pi   ]
+            side2 = [ (x - cos(ang)*dist), (y - sin(ang)*dist), ang        ]
+            side3 = [ (x + sin(ang)*dist), (y - cos(ang)*dist), ang + pi/2 ]
+            side4 = [ (x - sin(ang)*dist), (y + cos(ang)*dist), ang - pi/2 ]
+
+            sides = (side1, side2, side3, side4)
+            sorted_sides = sorted(sides, key=lambda pt: (pt[0]-rx)**2 + (pt[1]-ry)**2)
+            return sorted_sides[0]
+
+    class GoToSide(WallPilotToPose):
+        def __init__(self):
+            super().__init__(None)
+
+        def start(self, event=None):
+            cube = self.parent.foreign_cube_id
+            print('Selected cube',self.robot.world.world_map.objects[cube])
+            (x, y, theta) = self.parent.pick_side(200, True)
+            self.target_pose = Pose(x, y, self.robot.pose.position.z,
+                                    angle_z=Angle(radians = wrap_angle(theta)))
+            print('pickup.GoToSide: traveling to (%.1f, %.1f) @ %.1f deg.' %
+                  (self.target_pose.position.x, self.target_pose.position.y,
+                   self.target_pose.rotation.angle_z.degrees))
+            super().start(event)
+
+    class Pick(PickUpCube):
+        def __init__(self):
+            super().__init__(None)
+
+        def start(self, event=None):
+            self.object = self.parent.object
+            super().start(event)
+
+    $setup{  # PickUpCube machine
+        goto_cube: self.GoToSide() =C=> one
+
+        one: self.Pick() =C=> end
+        end: Say("Done") =C=> ParentCompletes()
+        }
